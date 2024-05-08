@@ -4,26 +4,32 @@ pragma solidity 0.8.18;
 import {AccessControlEnumerableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {EnumerableSetUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/structs/EnumerableSetUpgradeable.sol";
-import {BaseUpgradeableModule} from "./BaseUpgradeableModule.sol";
+import {BaseUpgradeableModule} from "../../BaseUpgradeableModule.sol";
 
-import {IAuthorization} from "../../interfaces/IAuthorization.sol";
-import {IHoldings} from "../../interfaces/IHoldings.sol";
-import {IShareholderTransaction} from "../../interfaces/TransactionIfaces.sol";
-import {IShareholderSelfServiceTransaction} from "../../interfaces/TransactionIfaces.sol";
-import {ITransferAgentTransaction} from "../../interfaces/TransactionIfaces.sol";
-import {ICancellableTransaction, ICancellableSelfServiceTransaction} from "../../interfaces/TransactionIfaces.sol";
-import {ITransactionStorage} from "../../interfaces/TransactionIfaces.sol";
+import {IAuthorization} from "../../../../interfaces/IAuthorization.sol";
+import {IAccountManager} from "../../../../interfaces/IAccountManager.sol";
+import {IHoldings} from "../../../../interfaces/IHoldings.sol";
+import {IShareholderTransaction} from "../../../../interfaces/TransactionIfaces.sol";
+import {IShareholderSelfServiceTransaction} from "../../../../interfaces/TransactionIfaces.sol";
+import {IShareholderTransferTransaction} from "../../../../interfaces/TransactionIfaces.sol";
+import {IShareholderSelfServiceTransferTransaction} from "../../../../interfaces/TransactionIfaces.sol";
+import {ITransferAgentTransaction} from "../../../../interfaces/TransactionIfaces.sol";
+import {ICancellableTransaction, ICancellableSelfServiceTransaction} from "../../../../interfaces/TransactionIfaces.sol";
+import {ITransactionStorage} from "../../../../interfaces/TransactionIfaces.sol";
+import {IExtendedTransactionDetail} from "../../../../interfaces/TransactionIfaces.sol";
 
-import {ModuleRegistry} from "../ModuleRegistry.sol";
-import {TokenRegistry} from "../../infrastructure/TokenRegistry.sol";
+import {ModuleRegistry} from "../../../ModuleRegistry.sol";
+import {TokenRegistry} from "../../../../infrastructure/TokenRegistry.sol";
 
-contract TransactionalModule is
+contract TransactionalModule_V3 is
     BaseUpgradeableModule,
     AccessControlEnumerableUpgradeable,
     IShareholderTransaction,
     IShareholderSelfServiceTransaction,
+    IShareholderTransferTransaction,
+    IShareholderSelfServiceTransferTransaction,
     ITransferAgentTransaction,
-    ITransactionStorage,
+    IExtendedTransactionDetail,
     ICancellableTransaction,
     ICancellableSelfServiceTransaction
 {
@@ -51,7 +57,7 @@ contract TransactionalModule is
     uint256 requestsCounter;
 
     /// @dev Map of all the existing pending requests
-    mapping(bytes32 => ITransactionStorage.TransactionDetail) transactionDetailMap;
+    mapping(bytes32 => IExtendedTransactionDetail.ExtendedTransactionDetail) transactionDetailMap;
     /// @dev Map of the list of pending requests id's per account
     mapping(address => EnumerableSetUpgradeable.Bytes32Set) pendingTransactionsMap;
     /// @dev Set containing the accounts with at least one pending requests
@@ -64,6 +70,14 @@ contract TransactionalModule is
     string tokenId;
 
     // ---------------------- Modifiers ----------------------  //
+    modifier accountNotFrozen(address account) {
+        require(
+            !IAccountManager(modules.getModuleAddress(AUTHORIZATION_MODULE))
+                .isAccountFrozen(account),
+            "ACCOUNT_IS_FROZEN"
+        );
+        _;
+    }
 
     modifier onlyAdmin() {
         require(
@@ -111,25 +125,6 @@ contract TransactionalModule is
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
-    }
-
-    function initialize(
-        address _moduleOwner,
-        address _modRegistry,
-        address _tokenRegistry,
-        string memory _defaultToken
-    ) public initializer {
-        require(_moduleOwner != address(0), "INVALID_ADDRESS");
-        require(_modRegistry != address(0), "INVALID_REGISTRY_ADDRESS");
-        require(_tokenRegistry != address(0), "INVALID_REGISTRY_ADDRESS");
-        __BaseUpgradeableModule_init();
-        __AccessControlEnumerable_init();
-        modules = ModuleRegistry(_modRegistry);
-        tokenRegistry = TokenRegistry(_tokenRegistry);
-        tokenId = _defaultToken;
-        _grantRole(DEFAULT_ADMIN_ROLE, _moduleOwner);
-        _setRoleAdmin(ROLE_MODULE_OWNER, ROLE_MODULE_OWNER);
-        _grantRole(ROLE_MODULE_OWNER, _moduleOwner);
     }
 
     function _authorizeUpgrade(
@@ -187,9 +182,10 @@ contract TransactionalModule is
         override
         onlyWithSelfServiceOn
         onlyShareholderAsMsgSender
+        accountNotFrozen(msg.sender)
         onlyHigherThanZero(amount)
     {
-        _createCashTransaction(
+        _createTransaction(
             msg.sender,
             ITransactionStorage.TransactionType.CASH_PURCHASE,
             true,
@@ -215,6 +211,7 @@ contract TransactionalModule is
         override
         onlyWithSelfServiceOn
         onlyShareholderAsMsgSender
+        accountNotFrozen(msg.sender)
     {
         require(
             IHoldings(tokenRegistry.getTokenAddress(tokenId)).hasEnoughHoldings(
@@ -223,7 +220,7 @@ contract TransactionalModule is
             ),
             "NOT_ENOUGH_BALANCE"
         );
-        _createCashTransaction(
+        _createTransaction(
             msg.sender,
             ITransactionStorage.TransactionType.CASH_LIQUIDATION,
             true,
@@ -245,6 +242,7 @@ contract TransactionalModule is
         override
         onlyWithSelfServiceOn
         onlyShareholderAsMsgSender
+        accountNotFrozen(msg.sender)
     {
         require(
             IHoldings(tokenRegistry.getTokenAddress(tokenId)).getShareHoldings(
@@ -252,12 +250,50 @@ contract TransactionalModule is
             ) > 0,
             "NOT_ENOUGH_BALANCE"
         );
-        _createCashTransaction(
+        _createTransaction(
             msg.sender,
             ITransactionStorage.TransactionType.FULL_LIQUIDATION,
             true,
             block.timestamp,
             0 // No amount required
+        );
+    }
+
+    /**
+     * @notice Creates a request by the shareholder to transfer shares to the given destination account.
+     *
+     * The shareholder's and the destination accounts must be previously authorized via the authorization API defined
+     * by the {IAuthorization} interface.
+     *
+     * @param amount the amount of shares to transfer
+     * @param destination the destination account
+     */
+    function requestSelfServiceShareTransfer(
+        uint256 amount,
+        address destination
+    )
+        external
+        onlyWithSelfServiceOn
+        onlyShareholderAsMsgSender
+        onlyShareholder(destination)
+        accountNotFrozen(msg.sender)
+        accountNotFrozen(destination)
+        onlyHigherThanZero(amount)
+    {
+        require(msg.sender != destination, "INVALID_TRANSFER_TO_SELF");
+        require(
+            IHoldings(tokenRegistry.getTokenAddress(tokenId)).getShareHoldings(
+                msg.sender
+            ) >= amount,
+            "NOT_ENOUGH_BALANCE"
+        );
+        _createTransferTransaction(
+            msg.sender,
+            destination,
+            ITransactionStorage.TransactionType.SHARE_TRANSFER,
+            true,
+            block.timestamp,
+            amount
         );
     }
 
@@ -325,9 +361,10 @@ contract TransactionalModule is
         override
         onlyAdmin
         onlyShareholder(account)
+        accountNotFrozen(account)
         onlyHigherThanZero(amount)
     {
-        _createCashTransaction(
+        _createTransaction(
             account,
             ITransactionStorage.TransactionType.CASH_PURCHASE,
             false,
@@ -351,7 +388,14 @@ contract TransactionalModule is
         address account,
         uint256 date,
         uint256 amount
-    ) external virtual override onlyAdmin onlyShareholder(account) {
+    )
+        external
+        virtual
+        override
+        onlyAdmin
+        onlyShareholder(account)
+        accountNotFrozen(account)
+    {
         require(
             IHoldings(tokenRegistry.getTokenAddress(tokenId)).hasEnoughHoldings(
                 account,
@@ -359,7 +403,7 @@ contract TransactionalModule is
             ),
             "NOT_ENOUGH_BALANCE"
         );
-        _createCashTransaction(
+        _createTransaction(
             account,
             ITransactionStorage.TransactionType.CASH_LIQUIDATION,
             false,
@@ -381,19 +425,66 @@ contract TransactionalModule is
     function requestFullLiquidation(
         address account,
         uint256 date
-    ) external virtual override onlyAdmin onlyShareholder(account) {
+    )
+        external
+        virtual
+        override
+        onlyAdmin
+        onlyShareholder(account)
+        accountNotFrozen(account)
+    {
         require(
             IHoldings(tokenRegistry.getTokenAddress(tokenId)).getShareHoldings(
                 account
             ) > 0,
             "NOT_ENOUGH_BALANCE"
         );
-        _createCashTransaction(
+        _createTransaction(
             account,
             ITransactionStorage.TransactionType.FULL_LIQUIDATION,
             false,
             date,
             0 // No amount required
+        );
+    }
+
+    /**
+     * @notice Creates a request to transfer shares from the given account to the destination account.
+     *
+     * The shareholder's and the destination accounts must be previously authorized via the authorization API defined
+     * by the {IAuthorization} interface.
+     *
+     * @param amount the shares to transfer
+     * @param destination the destination account to transfer the shares
+     */
+    function requestShareTransfer(
+        address account,
+        address destination,
+        uint256 date,
+        uint256 amount
+    )
+        external
+        virtual
+        onlyAdmin
+        onlyShareholder(account)
+        onlyShareholder(destination)
+        accountNotFrozen(account)
+        accountNotFrozen(destination)
+        onlyHigherThanZero(amount)
+    {
+        require(
+            IHoldings(tokenRegistry.getTokenAddress(tokenId)).getShareHoldings(
+                account
+            ) >= amount,
+            "NOT_ENOUGH_BALANCE"
+        );
+        _createTransferTransaction(
+            account,
+            destination,
+            ITransactionStorage.TransactionType.SHARE_TRANSFER,
+            false,
+            date,
+            amount
         );
     }
 
@@ -459,9 +550,10 @@ contract TransactionalModule is
         override
         onlyAdmin
         onlyShareholder(account)
+        accountNotFrozen(account)
         onlyHigherThanZero(amount)
     {
-        _createCashTransaction(
+        _createTransaction(
             account,
             ITransactionStorage.TransactionType.AIP,
             false,
@@ -494,8 +586,13 @@ contract TransactionalModule is
                 ).hasRole(keccak256("WRITE_ACCESS_TRANSACTION"), msg.sender),
             "NO_WRITE_ACCESS"
         );
-        delete transactionDetailMap[requestId];
-        return pendingTransactionsMap[account].remove(requestId);
+
+        if (pendingTransactionsMap[account].remove(requestId)) {
+            delete transactionDetailMap[requestId];
+            return true;
+        }
+
+        return false;
     }
 
     /**
@@ -543,6 +640,24 @@ contract TransactionalModule is
         );
     }
 
+    function getExtendedTransactionDetail(
+        bytes32 requestId
+    )
+        external
+        view
+        override
+        returns (uint8, address, address, uint256, uint256, bool)
+    {
+        return (
+            uint8(transactionDetailMap[requestId].txType),
+            transactionDetailMap[requestId].source,
+            transactionDetailMap[requestId].destination,
+            transactionDetailMap[requestId].date,
+            transactionDetailMap[requestId].amount,
+            transactionDetailMap[requestId].selfService
+        );
+    }
+
     function getAccountsWithTransactions(
         uint256 pageSize
     ) external view virtual override returns (address[] memory accounts) {
@@ -584,7 +699,7 @@ contract TransactionalModule is
     }
 
     function getVersion() external pure virtual override returns (uint8) {
-        return 1;
+        return 3;
     }
 
     // -------------------- Internal --------------------  //
@@ -597,15 +712,15 @@ contract TransactionalModule is
         accountsWithTransactions.remove(account);
     }
 
-    function _createCashTransaction(
+    function _createTransaction(
         address account,
         ITransactionStorage.TransactionType txType,
         bool selfService,
         uint256 date,
         uint256 amount
-    ) internal virtual {
+    ) internal virtual returns (bytes32 requestId) {
         requestsCounter += 1;
-        bytes32 requestId = _getTxId(account, date);
+        requestId = _getTxId(account, date);
         require(
             pendingTransactionsMap[account].add(requestId),
             "INVALID_TRANSACTION_ID"
@@ -617,6 +732,25 @@ contract TransactionalModule is
         transactionDetailMap[requestId].selfService = selfService;
 
         emit TransactionSubmitted(account, requestId);
+    }
+
+    function _createTransferTransaction(
+        address account,
+        address destination,
+        ITransactionStorage.TransactionType txType,
+        bool selfService,
+        uint256 date,
+        uint256 amount
+    ) internal virtual returns (bytes32 requestId) {
+        requestId = _createTransaction(
+            account,
+            txType,
+            selfService,
+            date,
+            amount
+        );
+        transactionDetailMap[requestId].source = account;
+        transactionDetailMap[requestId].destination = destination;
     }
 
     function _getTxId(

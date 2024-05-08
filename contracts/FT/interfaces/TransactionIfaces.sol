@@ -14,7 +14,8 @@ interface ITransactionStorage {
         SHARE_LIQUIDATION,
         CASH_PURCHASE,
         SHARE_PURCHASE,
-        FULL_LIQUIDATION
+        FULL_LIQUIDATION,
+        SHARE_TRANSFER
     }
 
     struct TransactionDetail {
@@ -60,6 +61,23 @@ interface ITransactionStorage {
     ) external view returns (bool);
 }
 
+// Extended interface introduced for the new Share Transfer functionality,
+// it was added in TransactionalModule_V3.sol
+interface IExtendedTransactionDetail is ITransactionStorage {
+    struct ExtendedTransactionDetail {
+        TransactionType txType;
+        uint256 date;
+        uint256 amount;
+        bool selfService;
+        address source;
+        address destination;
+    }
+
+    function getExtendedTransactionDetail(
+        bytes32 requestId
+    ) external view returns (uint8, address, address, uint256, uint256, bool);
+}
+
 interface IShareholderTransaction {
     function requestCashPurchase(
         address account,
@@ -76,6 +94,15 @@ interface IShareholderTransaction {
     function requestFullLiquidation(address account, uint256 date) external;
 }
 
+interface IShareholderTransferTransaction {
+    function requestShareTransfer(
+        address account,
+        address destination,
+        uint256 date,
+        uint256 amount
+    ) external;
+}
+
 interface IShareholderSelfServiceTransaction {
     function requestSelfServiceCashPurchase(uint256 amount) external;
 
@@ -88,6 +115,13 @@ interface IShareholderSelfServiceTransaction {
     function disableSelfService() external;
 
     function isSelfServiceEnabled() external view returns (bool);
+}
+
+interface IShareholderSelfServiceTransferTransaction {
+    function requestSelfServiceShareTransfer(
+        uint256 amount,
+        address destination
+    ) external;
 }
 
 interface ITransferAgentTransaction {
