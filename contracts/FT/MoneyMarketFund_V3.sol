@@ -7,10 +7,12 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
-import {ModuleRegistry} from "./infrastructure/ModuleRegistry.sol";
-import {IAuthorization} from "./interfaces/IAuthorization.sol";
-import {ITransferAgent} from "./interfaces/ITransferAgent.sol";
-import {IHoldings} from "./interfaces/IHoldings.sol";
+import {ModuleRegistry} from "../../../../infrastructure/ModuleRegistry.sol";
+import {IAccountManager} from "../../../../interfaces/IAccountManager.sol";
+import {IAuthorization} from "../../../../interfaces/IAuthorization.sol";
+import {ITransferAgent} from "../../../../interfaces/ITransferAgent.sol";
+import {IHoldings} from "../../../../interfaces/IHoldings.sol";
+import {IAdminTransfer} from "../../../../interfaces/IAdminTransfer.sol";
 
 /**
  * @title Implementation of a Money Market Fund
@@ -23,12 +25,13 @@ import {IHoldings} from "./interfaces/IHoldings.sol";
  * The price supplied in the settlement functions corresponds to the NAV per share at the moment of the market closing.
  *
  */
-contract MoneyMarketFund is
+contract MoneyMarketFund_V3 is
     Initializable,
     ERC20Upgradeable,
     AccessControlUpgradeable,
     UUPSUpgradeable,
-    IHoldings
+    IHoldings,
+    IAdminTransfer
 {
     using EnumerableSet for EnumerableSet.AddressSet;
 
@@ -81,34 +84,6 @@ contract MoneyMarketFund is
         _disableInitializers();
     }
 
-    function _initToken(address owner, uint256 seed, uint256 price) private {
-        lastKnownPrice = price;
-        if (seed > 0) {
-            _mint(owner, seed);
-        }
-    }
-
-    function initialize(
-        address _owner_,
-        uint256 _seed_,
-        uint256 _price_,
-        string memory _name_,
-        string memory _symbol_,
-        address _moduleRegistry_
-    ) public initializer {
-        require(_owner_ != address(0), "Owner must not be empty!");
-        require(_moduleRegistry_ != address(0), "INVALID_REGISTRY_ADDRESS");
-        __ERC20_init(_name_, _symbol_);
-        __AccessControl_init();
-        __UUPSUpgradeable_init();
-        moduleRegistry = ModuleRegistry(_moduleRegistry_);
-        _grantRole(DEFAULT_ADMIN_ROLE, _owner_);
-        _setRoleAdmin(ROLE_TOKEN_OWNER, ROLE_TOKEN_OWNER);
-        _grantRole(ROLE_TOKEN_OWNER, _owner_);
-
-        _initToken(_owner_, _seed_, _price_);
-    }
-
     function _authorizeUpgrade(
         address newImplementation
     ) internal virtual override onlyRole(ROLE_TOKEN_OWNER) {}
@@ -128,6 +103,23 @@ contract MoneyMarketFund is
         uint256 shares
     ) external virtual onlyAdminOrWriteAccess {
         _burn(account, shares);
+    }
+
+    /**
+     * @dev Admin function to transfer shares from one account to another without the need of allowance
+     * approval. It uses the internal OpenZeppellin _transfer function for implementing such use cases.
+     * To ensure proper access this external API is protected with role based access control.
+     *
+     * @param from source account
+     * @param to  destination account to transfer shares
+     * @param amount the amount of shares to transfer
+     */
+    function transferShares(
+        address from,
+        address to,
+        uint256 amount
+    ) external virtual onlyAdminOrWriteAccess {
+        _transfer(from, to, amount);
     }
 
     function updateHolderInList(
@@ -202,7 +194,8 @@ contract MoneyMarketFund is
             bool hasNext,
             uint256 nextIndex,
             address[] memory accounts,
-            uint256[] memory balances
+            uint256[] memory balances,
+            bool[] memory status
         )
     {
         uint256 count = IAuthorization(
@@ -222,6 +215,7 @@ contract MoneyMarketFund is
 
         accounts = new address[](arraySize);
         balances = new uint256[](arraySize);
+        status = new bool[](arraySize);
         nextIndex = end;
 
         for (uint256 i = startIndex; i < end; ) {
@@ -230,10 +224,17 @@ contract MoneyMarketFund is
                 moduleRegistry.getModuleAddress(AUTHORIZATION_MODULE)
             ).getAuthorizedAccountAt(i);
             balances[resIdx] = balanceOf(accounts[resIdx]);
+            status[resIdx] = IAccountManager(
+                moduleRegistry.getModuleAddress(AUTHORIZATION_MODULE)
+            ).isAccountFrozen(accounts[resIdx]);
             unchecked {
                 i++;
             }
         }
+    }
+
+    function getVersion() public pure virtual returns (uint8) {
+        return 3;
     }
 
     // **************** Internal Functions ***************** //
@@ -262,40 +263,34 @@ contract MoneyMarketFund is
         address from,
         address to
     ) internal view virtual {
-        if (from == address(0)) {
-            // Minting policy
+        if (
+            IAccessControlUpgradeable(
+                moduleRegistry.getModuleAddress(AUTHORIZATION_MODULE)
+            ).hasRole(keccak256("WRITE_ACCESS_TOKEN"), _msgSender()) ||
+            IAuthorization(
+                moduleRegistry.getModuleAddress(AUTHORIZATION_MODULE)
+            ).isAdminAccount(_msgSender())
+        ) {
             require(
                 IAuthorization(
                     moduleRegistry.getModuleAddress(AUTHORIZATION_MODULE)
                 ).isAdminAccount(to) ||
                     IAuthorization(
                         moduleRegistry.getModuleAddress(AUTHORIZATION_MODULE)
-                    ).isAccountAuthorized(to),
+                    ).isAccountAuthorized(to) ||
+                    to == address(0),
                 "TRANSFER_RESTRICTION"
             );
         } else if (
             IAuthorization(
                 moduleRegistry.getModuleAddress(AUTHORIZATION_MODULE)
-            ).isAdminAccount(from)
+            ).isAccountAuthorized(_msgSender())
         ) {
-            // Transfer policy
-            if (to != address(0)) {
-                require(
-                    IAuthorization(
-                        moduleRegistry.getModuleAddress(AUTHORIZATION_MODULE)
-                    ).isAccountAuthorized(to),
-                    "TRANSFER_RESTRICTION"
-                );
-            }
-        } else if (
-            IAuthorization(
-                moduleRegistry.getModuleAddress(AUTHORIZATION_MODULE)
-            ).isAccountAuthorized(from)
-        ) {
-            // Burning policy
+            // Only Burning allowed
+            require(from == _msgSender(), "TRANSFER_RESTRICTION");
             require(to == address(0), "TRANSFER_RESTRICTION");
         } else {
-            // Any other transfer is restricted
+            // Any other type of transfer is restricted
             revert("TRANSFER_RESTRICTION");
         }
     }

@@ -4,20 +4,25 @@ pragma solidity 0.8.18;
 import {AccessControlEnumerableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {EnumerableSetUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/structs/EnumerableSetUpgradeable.sol";
-import {BaseUpgradeableModule} from "./BaseUpgradeableModule.sol";
+import {BaseUpgradeableModule} from "../../BaseUpgradeableModule.sol";
 
-import {IAuthorization} from "../../interfaces/IAuthorization.sol";
-import {IHoldings} from "../../interfaces/IHoldings.sol";
-import {ITransactionStorage} from "../../interfaces/TransactionIfaces.sol";
-import {ITransferAgent} from "../../interfaces/ITransferAgent.sol";
-import {MoneyMarketFund} from "../../MoneyMarketFund.sol";
-import {ModuleRegistry} from "../ModuleRegistry.sol";
-import {TokenRegistry} from "../../infrastructure/TokenRegistry.sol";
+import {IAuthorization} from "../../../../interfaces/IAuthorization.sol";
+import {IHoldings} from "../../../../interfaces/IHoldings.sol";
+import {IAdminTransfer} from "../../../../interfaces/IAdminTransfer.sol";
+import {ITransactionStorage} from "../../../../interfaces/TransactionIfaces.sol";
+import {IExtendedTransactionDetail} from "../../../../interfaces/TransactionIfaces.sol";
+import {ITransferAgent} from "../../../../interfaces/ITransferAgent.sol";
+import {IRecovery} from "../../../../interfaces/IRecovery.sol";
+import {IAccountManager} from "../../../../interfaces/IAccountManager.sol";
+import {MoneyMarketFund} from "../../../../MoneyMarketFund.sol";
+import {ModuleRegistry} from "../../../ModuleRegistry.sol";
+import {TokenRegistry} from "../../../../infrastructure/TokenRegistry.sol";
 
-contract TransferAgentModule is
+contract TransferAgentModule_V3 is
     BaseUpgradeableModule,
     AccessControlEnumerableUpgradeable,
-    ITransferAgent
+    ITransferAgent,
+    IRecovery
 {
     bytes32 public constant MODULE_ID = keccak256("MODULE_TRANSFER_AGENT");
     bytes32 public constant ROLE_MODULE_OWNER = keccak256("ROLE_MODULE_OWNER");
@@ -58,8 +63,32 @@ contract TransferAgentModule is
         uint256 amount,
         uint256 shares
     );
+    /// @dev This is emitted when a share transfer is settled:
+    event TransferSettled(
+        address indexed from,
+        address indexed to,
+        uint256 indexed date,
+        uint8 transactionType,
+        bytes32 transactionId,
+        uint256 price,
+        uint256 shares
+    );
     /// @dev This is emitted when a manual adjustment of the balance is performed by the TA:
     event BalanceAdjusted(address indexed account, uint256 amount, string memo);
+    /// @dev This is emmited when the entire balance of an account is recovered by the TA:
+    event AccountRecovered(
+        address indexed fromAccount,
+        address indexed toAccount,
+        uint256 amount,
+        string memo
+    );
+    /// @dev This is emmited when a partial balance amount of an account is recovered by the TA:
+    event AssetRecovered(
+        address indexed fromAccount,
+        address indexed toAccount,
+        uint256 amount,
+        string memo
+    );
 
     // ---------------------- Modifiers ----------------------  //
 
@@ -88,12 +117,6 @@ contract TransferAgentModule is
         _;
     }
 
-    modifier whenLessThanZero(int256 rate) {
-        if (rate < 0) {
-            _;
-        }
-    }
-
     // ---------------- Transactions ----------------  //
 
     modifier onlyValidPaginationSize(
@@ -118,34 +141,12 @@ contract TransferAgentModule is
         _disableInitializers();
     }
 
-    function initialize(
-        address _moduleOwner,
-        address _modRegistry,
-        address _tokenRegistry,
-        string memory _defaultToken
-    ) public initializer {
-        require(_moduleOwner != address(0), "INVALID_ADDRESS");
-        require(_modRegistry != address(0), "INVALID_REGISTRY_ADDRESS");
-        require(_tokenRegistry != address(0), "INVALID_REGISTRY_ADDRESS");
-        __BaseUpgradeableModule_init();
-        __AccessControlEnumerable_init();
-        modules = ModuleRegistry(_modRegistry);
-        tokenRegistry = TokenRegistry(_tokenRegistry);
-        tokenId = _defaultToken;
-        address tokenAddress = tokenRegistry.getTokenAddress(tokenId);
-        require(tokenAddress != address(0), "INVALID_TOKEN_ADDRESS");
-        moneyMarketFund = MoneyMarketFund(tokenAddress);
-        _grantRole(DEFAULT_ADMIN_ROLE, _moduleOwner);
-        _setRoleAdmin(ROLE_MODULE_OWNER, ROLE_MODULE_OWNER);
-        _grantRole(ROLE_MODULE_OWNER, _moduleOwner);
-    }
-
     function _authorizeUpgrade(
         address newImplementation
     ) internal virtual override onlyRole(ROLE_MODULE_OWNER) {}
 
     function getVersion() external pure virtual override returns (uint8) {
-        return 1;
+        return 3;
     }
 
     function adjustBalance(
@@ -274,6 +275,75 @@ contract TransferAgentModule is
         }
     }
 
+    /**
+     * @dev Recovers the entire balance of an account
+     *
+     * @param from the account holding the balance to recover
+     * @param to the destination account to transfer the balance
+     * @param memo a memo for the recovery operation
+     */
+    function recoverAccount(
+        address from,
+        address to,
+        string memory memo
+    ) external virtual override onlyAdmin {
+        // Checks
+        require(
+            !ITransactionStorage(modules.getModuleAddress(TRANSACTIONAL_MODULE))
+                .hasTransactions(from),
+            "PENDING_TRANSACTIONS_EXIST"
+        );
+        require(
+            moneyMarketFund.getShareHoldings(from) > 0,
+            "ACCOUNT_HAS_NO_BALANCE"
+        );
+        uint256 balance = moneyMarketFund.getShareHoldings(from);
+
+        // Effects & Interactions
+        moneyMarketFund.burnShares(from, balance);
+        moneyMarketFund.mintShares(to, balance);
+        moneyMarketFund.updateHolderInList(from);
+        moneyMarketFund.updateHolderInList(to);
+        IAccountManager(modules.getModuleAddress(AUTHORIZATION_MODULE))
+            .removeAccountPostRecovery(from, to);
+
+        emit AccountRecovered(from, to, balance, memo);
+    }
+
+    /**
+     * @dev Recovers a part of the balance of an account
+     *
+     * @param from the account holding the balance amount to recover
+     * @param to the destination account to transfer the balance
+     * @param memo a memo for the recovery operation
+     */
+    function recoverAsset(
+        address from,
+        address to,
+        uint256 amount,
+        string memory memo
+    ) external virtual override onlyAdmin {
+        // Checks
+        require(
+            IAuthorization(modules.getModuleAddress(AUTHORIZATION_MODULE))
+                .isAccountAuthorized(from) &&
+                IAuthorization(modules.getModuleAddress(AUTHORIZATION_MODULE))
+                    .isAccountAuthorized(to),
+            "SHAREHOLDER_DOES_NOT_EXISTS"
+        );
+
+        uint256 balance = moneyMarketFund.getShareHoldings(from);
+        require(balance >= amount, "NOT_ENOUGH_BALANCE");
+
+        // Effects & Interactions
+        moneyMarketFund.burnShares(from, amount);
+        moneyMarketFund.mintShares(to, amount);
+        moneyMarketFund.updateHolderInList(from);
+        moneyMarketFund.updateHolderInList(to);
+
+        emit AssetRecovered(from, to, amount, memo);
+    }
+
     // -------------------- Dividends --------------------  //
 
     function _payDividend(
@@ -281,16 +351,14 @@ contract TransferAgentModule is
         int256 rate,
         uint256 dividendShares
     ) internal virtual {
-        if (rate > 0) {
-            moneyMarketFund.mintShares(account, dividendShares);
-        }
+        moneyMarketFund.mintShares(account, dividendShares);
     }
 
     function _handleNegativeYield(
         address account,
         int256 rate,
         uint256 dividendShares
-    ) internal whenLessThanZero(rate) {
+    ) internal {
         uint256 negativeYield;
         if (dividendShares < moneyMarketFund.balanceOf(account)) {
             negativeYield = dividendShares;
@@ -314,12 +382,14 @@ contract TransferAgentModule is
             bytes32 txId = pendingTxs[i];
             (
                 uint8 txType,
+                address source,
+                address destination,
                 uint256 txDate,
                 uint256 amount,
 
-            ) = ITransactionStorage(
+            ) = IExtendedTransactionDetail(
                     modules.getModuleAddress(TRANSACTIONAL_MODULE)
-                ).getTransactionDetail(txId);
+                ).getExtendedTransactionDetail(txId);
             require(
                 _isTypeSupported(ITransactionStorage.TransactionType(txType)),
                 "INVALID_TRANSACTION_TYPE"
@@ -347,6 +417,25 @@ contract TransferAgentModule is
                         txId,
                         ITransactionStorage.TransactionType(txType)
                     );
+                } else if (
+                    ITransactionStorage.TransactionType(txType) ==
+                    ITransactionStorage.TransactionType.SHARE_TRANSFER
+                ) {
+                    IAdminTransfer(tokenRegistry.getTokenAddress(tokenId))
+                        .transferShares(source, destination, amount);
+                    // Also update destination account for this TX type
+                    // as a transfer changes the state of both accounts.
+                    // For transfers account and source are the samme address.
+                    moneyMarketFund.updateHolderInList(destination);
+                    emit TransferSettled(
+                        source,
+                        destination,
+                        date,
+                        txType,
+                        txId,
+                        price,
+                        amount // shares
+                    );
                 }
                 moneyMarketFund.updateHolderInList(account);
                 ITransactionStorage(
@@ -372,9 +461,14 @@ contract TransferAgentModule is
                 uint256(abs(rate));
             uint256 dividendShares = dividendAmount / price;
 
-            _payDividend(account, rate, dividendShares);
-            // handle very unlikely scenario if occurs
-            _handleNegativeYield(account, rate, dividendShares);
+            // a valid rate for this internal function (rate != 0) is verified
+            // in the calling function via the  'onlyWithValidRate' modifier
+            if (rate > 0) {
+                _payDividend(account, rate, dividendShares);
+            } else {
+                // handle very unlikely scenario if occurs
+                _handleNegativeYield(account, rate, dividendShares);
+            }
             moneyMarketFund.removeEmptyHolderFromList(account);
 
             emit DividendDistributed(
@@ -454,7 +548,8 @@ contract TransferAgentModule is
         return (txType == ITransactionStorage.TransactionType.AIP ||
             txType == ITransactionStorage.TransactionType.CASH_PURCHASE ||
             txType == ITransactionStorage.TransactionType.CASH_LIQUIDATION ||
-            txType == ITransactionStorage.TransactionType.FULL_LIQUIDATION);
+            txType == ITransactionStorage.TransactionType.FULL_LIQUIDATION ||
+            txType == ITransactionStorage.TransactionType.SHARE_TRANSFER);
     }
 
     function _isPurchase(

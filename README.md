@@ -24,6 +24,30 @@ Smart contracts source code has been audited by [Trail Of Bits](https://www.trai
 
 ### v1.0
   - Initial version of the Smart Contracts
+### v2.0
+#### 1. Account Freeze/Unfreeze & Account Recovery
+Features:
+    - Add Freeze/Unfreeze functions to AuthorizationModule
+    - Add restrictions for trade creation in TransactionalModule
+    - Update view function (getAccountBalances) in token contract
+    - Add full balance recovery function to TransferAgentModule
+    - Add partial balance recovery function to TransferAgentModule
+Smart contracts upgraded:
+    - MoneyMarketFund_V1 -> MoneyMarketFund_V2
+    - AuthorizationModule_V1 -> AuthorizationModule_V2
+    - TransactionalModule_V1 -> TransactionalModule_V2
+    - TransferAgentModule_V1 -> TransferAgentModule_V2
+
+#### 2. Share Transfers
+Features:
+    - Update Transactional Module (Add new Tx type and Tx detail)
+    - Updade Transfer Agent Module (Update settlement to support new Tx type)
+    - Update Money Market Fund Token (Update transfer policy)
+Smart contracts upgraded:
+    - MoneyMarketFund_V2 -> MoneyMarketFund_V3
+    - TransactionalModule_V2 -> TransactionalModule_V3
+    - TransferAgentModule_V2 -> TransferAgentModule_V3
+
 
 ## Contributing
 This repository is not an open source project and we do not accept Pull Requests being raised. The ones created will be auto-closed.
